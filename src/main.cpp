@@ -4,9 +4,9 @@
  * PA6 -> CST6118 INA (TCD0 WOA - PWM controlled)
  * PA7 -> CST6118 INB (Digital output for direction control)
  *
- * CST6118 PWM Mode B: One pin PWM, other pin HIGH
- * - PA6=PWM, PA7=HIGH for reverse direction
- * - PA6=HIGH, PA7=PWM for forward direction (future enhancement)
+ * Modes used:
+ * - Forward (Mode A):  PA6=PWM, PA7=LOW (conduction <-> standby)
+ * - Reverse (Mode B):  PA6=PWM, PA7=HIGH (conduction <-> brake, duty inverted)
  */
 #include <Arduino.h>
 #include <avr/io.h>
@@ -31,6 +31,7 @@ void pwm_init(void) {
   // Start with 0% duty (motor off)
   TCD0.CMPASET = 0x000;
   TCD0.CMPACLR = 0x000;
+  // We only use WOA (PA6) for PWM; PA7 stays GPIO for direction
   
   // System clock with DIV4 prescaler but no synchronization prescaler
   TCD0.CTRLA = TCD_CLKSEL_SYSCLK_gc | TCD_CNTPRES_DIV4_gc | TCD_SYNCPRES_DIV1_gc;
@@ -66,9 +67,11 @@ void setPWM_PA6(uint8_t duty) {
   pwm_sync();
 }
 
-// Motor control using CST6118 PWM Mode B
+// (No PWM on PA7; PA7 is used as a GPIO for direction)
+
+// Motor control using CST6118
 // PA6 = PWM (speed control)
-// PA7 = Digital HIGH (constant)
+// PA7 = Direction/control level
 
 // Stop motor
 void motorStop() {
@@ -76,17 +79,25 @@ void motorStop() {
   digitalWrite(PIN_PA7, LOW);
 }
 
+// Run motor forward with speed control (0-255)
+// Mode A: PA6=PWM, PA7=LOW toggles between Forward (H,L) and Standby (L,L)
+// Higher duty => more conduction time => faster
+void motorForward(uint8_t speed) {
+  digitalWrite(PIN_PA7, LOW);
+  setPWM_PA6(speed);
+}
+
 // Run motor in reverse with speed control (0-255)
-// Mode B: PA6=PWM, PA7=HIGH alternates between Reverse (L,H) and Brake (H,H)
-// Lower PA6 duty = more time in Reverse = faster
-// So we invert: higher speed value = lower PWM duty
+// Mode B for reverse: PA7=HIGH, PA6=PWM toggles between Reverse (L,H) and Brake (H,H)
+// Invert duty: higher speed = lower duty (more reverse conduction time)
 void motorReverse(uint8_t speed) {
-  digitalWrite(PIN_PA7, HIGH);     // Keep PA7 HIGH for Mode B
-  setPWM_PA6(255 - speed);         // Invert: high speed = low duty = more reverse time
+  digitalWrite(PIN_PA7, HIGH);
+  setPWM_PA6(255 - speed);
 }
 
 void setup() {
-  // Setup PA7 as digital output
+  // Setup PA6/PA7 as digital outputs (TCD will drive them when enabled)
+  pinMode(PIN_PA6, OUTPUT);
   pinMode(PIN_PA7, OUTPUT);
   
   // Initialize PWM on PA6
@@ -99,33 +110,30 @@ void setup() {
 }
 
 void loop() {
-  // Test different speeds
-  
-  // Motor OFF
-  motorStop();
+  // Demo: forward then reverse at a few speeds
+
+  // motorStop();
+  // _delay_ms(1000);
+
+  // // Forward
+  // motorForward(80);
+  // _delay_ms(2000);
+  motorForward(80);
   _delay_ms(2000);
-  
-  // Very slow - 20% speed
-  motorReverse(50);
-  _delay_ms(3000);
-  
-  // Medium slow - 40% speed
-  motorReverse(100);
-  _delay_ms(3000);
-  
-  // Half speed - 50%
-  motorReverse(128);
-  _delay_ms(3000);
-  
-  // Fast - 80% speed
-  motorReverse(200);
-  _delay_ms(3000);
-  
-  // Full speed - 100%
-  motorReverse(255);
-  _delay_ms(3000);
-  
-  // Stop
+  // motorForward(255);
+  // _delay_ms(2000);
+
   motorStop();
+  _delay_ms(1000);
+
+  // Reverse
+  // motorReverse(80);
+  // _delay_ms(2000);
+  motorReverse(80);
   _delay_ms(2000);
+  // motorReverse(255);
+  // _delay_ms(2000);
+
+  // motorStop();
+  // _delay_ms(1500);
 }

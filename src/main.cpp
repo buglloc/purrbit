@@ -1,139 +1,148 @@
 /*
- * ATtiny412 + CST6118 Motor Driver with PWM Control
+ * ATtiny412 + CST6118 Motor Driver
  *
- * PA6 -> CST6118 INA (TCD0 WOA - PWM controlled)
- * PA7 -> CST6118 INB (Digital output for direction control)
+ * Features:
+ * - 3 play modes with bidirectional motor control:
+ *   * CHILL:  Gentle alternating forward/reverse (60% speed, predictable pattern)
+ *   * WARMUP: Random forward/reverse bursts (50-80% speed, medium chaos)
+ *   * CRAZY:  Rapid erratic movements with direction changes (60-100% speed, maximum chaos)
+ * - Forward/Reverse motor control with TCD0 PWM
+ * - Global 70% duty cycle limiter for motor safety
+ * - 20-second placement pause when changing modes (motor stopped for safe positioning)
+ * - Auto-sleep after 10 minutes of activity (battery saving)
+ * - Manual power-down sleep mode for battery saving
+ * - Button control: short press = mode change, long press = sleep
  *
- * Modes used:
+ * Hardware:
+ * - PA6 -> CST6118 INA (TCD0 WOA - PWM controlled)
+ * - PA7 -> CST6118 INB (GPIO for direction control)
+ * - PA1 -> Button (with pull-up)
+ * - PA2 -> Green LED
+ * - PA3 -> Red LED
+ *
+ * Motor Control Modes:
  * - Forward (Mode A):  PA6=PWM, PA7=LOW (conduction <-> standby)
  * - Reverse (Mode B):  PA6=PWM, PA7=HIGH (conduction <-> brake, duty inverted)
  */
+
 #include <Arduino.h>
-#include <avr/io.h>
-#include <util/delay.h>
+#include "config.h"
+#include "motor.h"
+#include "behaviors.h"
+#include "power.h"
+#include "ui.h"
 
-// Initialize TCD0 for PWM on PA6 only
-void pwm_init(void) {
-  // Enable-protected reg must have 0 written to enable bit before changing other bits
-  TCD0.CTRLA &= ~TCD_ENABLE_bm;
-  
-  // Wait for it to be ready
-  while (!(TCD0.STATUS & TCD_ENRDY_bm));
-  
-  // Don't need overlapping PWM signals so just do oneramp
-  TCD0.CTRLB = TCD_WGMODE_ONERAMP_gc;
-  
-  // Disable all input control
-  TCD0.INPUTCTRLA = TCD_INPUTMODE_NONE_gc;
-  TCD0.INPUTCTRLB = TCD_INPUTMODE_NONE_gc;
-  
-  // Set/clear values to create desired duty cycle
-  // Start with 0% duty (motor off)
-  TCD0.CMPASET = 0x000;
-  TCD0.CMPACLR = 0x000;
-  // We only use WOA (PA6) for PWM; PA7 stays GPIO for direction
-  
-  // System clock with DIV4 prescaler but no synchronization prescaler
-  TCD0.CTRLA = TCD_CLKSEL_SYSCLK_gc | TCD_CNTPRES_DIV4_gc | TCD_SYNCPRES_DIV1_gc;
-}
+// ========== GLOBAL STATE ==========
 
-void pwm_start(void) {
-  // Turn off output override (we want PWM to run)
-  TCD0.CTRLC &= ~TCD_CMPOVR_bm;
-  
-  // Enable WOA (PA6) only. FAULTCTRL is write protected.
-  CPU_CCP = CCP_IOREG_gc;
-  TCD0.FAULTCTRL = TCD_CMPAEN_bm;
-  
-  while (!(TCD0.STATUS & TCD_ENRDY_bm)) {
-    ;
-  }
-  
-  TCD0.CTRLA |= TCD_ENABLE_bm;
-}
+PlayMode currentMode = MODE_CHILL;       // Current play mode
+uint32_t activityStartTime = 0;          // Tracks when activity started (for auto-sleep)
+uint32_t modeChangeTime = 0;             // Tracks when mode was changed (for placement pause)
+bool paused = false;                     // True during the 20-second placement pause
 
-// Sync PWM after updating compare values
-void pwm_sync(void) {
-  TCD0.CTRLE = TCD_SYNCEOC_bm;
-}
-
-// Set PWM duty cycle for PA6 (0-255)
-void setPWM_PA6(uint8_t duty) {
-  // Scale 8-bit (0-255) to 9-bit (0-511)
-  uint16_t scaled = ((uint16_t)duty << 1);
-  
-  TCD0.CMPASET = 0x000;
-  TCD0.CMPACLR = scaled;
-  pwm_sync();
-}
-
-// (No PWM on PA7; PA7 is used as a GPIO for direction)
-
-// Motor control using CST6118
-// PA6 = PWM (speed control)
-// PA7 = Direction/control level
-
-// Stop motor
-void motorStop() {
-  setPWM_PA6(0);
-  digitalWrite(PIN_PA7, LOW);
-}
-
-// Run motor forward with speed control (0-255)
-// Mode A: PA6=PWM, PA7=LOW toggles between Forward (H,L) and Standby (L,L)
-// Higher duty => more conduction time => faster
-void motorForward(uint8_t speed) {
-  digitalWrite(PIN_PA7, LOW);
-  setPWM_PA6(speed);
-}
-
-// Run motor in reverse with speed control (0-255)
-// Mode B for reverse: PA7=HIGH, PA6=PWM toggles between Reverse (L,H) and Brake (H,H)
-// Invert duty: higher speed = lower duty (more reverse conduction time)
-void motorReverse(uint8_t speed) {
-  digitalWrite(PIN_PA7, HIGH);
-  setPWM_PA6(255 - speed);
-}
+// =============================================================================
+// SETUP - Initialize all hardware and subsystems
+// =============================================================================
 
 void setup() {
-  // Setup PA6/PA7 as digital outputs (TCD will drive them when enabled)
-  pinMode(PIN_PA6, OUTPUT);
-  pinMode(PIN_PA7, OUTPUT);
+  // Initialize UI (button and LEDs)
+  buttonInit();
+  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_LED_GREEN, OUTPUT);
   
-  // Initialize PWM on PA6
-  pwm_init();
-  pwm_start();
+  // Set LEDs to known state (HIGH = off for active-low LEDs)
+  digitalWrite(PIN_LED_RED, HIGH);
+  digitalWrite(PIN_LED_GREEN, HIGH);
+
+  // Initialize motor control (TCD0 PWM on PA6)
+  pwmInit();
+  pwmStart();
   
-  // Start with motor stopped
+  // Configure motor control pin PA7 as output
+  pinMode(PIN_MOTOR_INB, OUTPUT);
+  digitalWrite(PIN_MOTOR_INB, LOW);
+
+  // Initialize motor stopped
   motorStop();
-  _delay_ms(100);
+
+  // Initialize power management
+  powerInit();
+
+  // Show initial mode LED
+  setLedMode(currentMode);
+
+  // Hardware test: brief motor pulse on startup to verify connection
+  delay(1000);  // Wait for power stabilization
+  
+  // Restore mode LED
+  setLedMode(currentMode);
+  
+  // Start the activity timer (10 minute auto-sleep countdown)
+  activityStartTime = millis();
 }
 
+// =============================================================================
+// MAIN LOOP
+// =============================================================================
+
 void loop() {
-  // Demo: forward then reverse at a few speeds
+  // Check for auto-sleep after 10 minutes of activity
+  if (checkAutoSleep(activityStartTime)) {
+    // Enter sleep mode
+    enterSleep();
+    
+    // Woke up from sleep - reset timers and state
+    activityStartTime = millis();
+    paused = false;
+    resetBehaviorState();
+    
+    // Ensure we're in an active mode
+    if (currentMode == MODE_OFF) {
+      currentMode = MODE_CHILL;
+    }
+    
+    // Restore LED indication
+    setLedMode(currentMode);
+  }
 
-  // motorStop();
-  // _delay_ms(1000);
+  // Handle button input
+  bool sleepRequested = false;
+  bool modeChanged = false;
+  currentMode = handleButton(currentMode, sleepRequested, modeChanged);
+  
+  // If mode was changed, start placement pause
+  if (modeChanged) {
+    paused = true;
+    modeChangeTime = millis();
+    motorStop();
+    resetBehaviorState();
+  }
+  
+  // If sleep was requested via long press
+  if (sleepRequested) {
+    // Enter sleep mode
+    enterSleep();
+    
+    // Woke up from sleep - reset timers and state
+    activityStartTime = millis();
+    paused = false;
+    resetBehaviorState();
+    
+    // Restore LED indication
+    setLedMode(currentMode);
+  }
 
-  // // Forward
-  // motorForward(80);
-  // _delay_ms(2000);
-  motorForward(80);
-  _delay_ms(2000);
-  // motorForward(255);
-  // _delay_ms(2000);
+  // Check if we're in the mode change placement pause
+  if (paused) {
+    if (millis() - modeChangeTime >= MODE_PAUSE_MS) {
+      // Pause is over, resume normal operation
+      paused = false;
+    } else {
+      // Still in pause - keep motor stopped, skip behavior update
+      motorStop();
+      return;
+    }
+  }
 
-  motorStop();
-  _delay_ms(1000);
-
-  // Reverse
-  // motorReverse(80);
-  // _delay_ms(2000);
-  motorReverse(80);
-  _delay_ms(2000);
-  // motorReverse(255);
-  // _delay_ms(2000);
-
-  // motorStop();
-  // _delay_ms(1500);
+  // Update motor behavior for current mode (only when not in pause)
+  updateMotorBehavior(currentMode);
 }
